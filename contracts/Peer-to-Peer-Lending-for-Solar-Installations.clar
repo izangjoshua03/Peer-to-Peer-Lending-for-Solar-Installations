@@ -11,6 +11,8 @@
 (define-constant err-already-funded (err u108))
 (define-constant err-funding-complete (err u109))
 (define-constant err-loan-defaulted (err u110))
+(define-constant err-loan-completed (err u111))
+(define-constant err-refinance-invalid (err u112))
 
 (define-data-var next-loan-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -71,6 +73,11 @@
 (define-map usage-reports
   { loan-id: uint, report-month: uint }
   { energy-generated: uint, reported-by: principal, report-date: uint }
+)
+
+(define-map refinance-history
+  { original-loan-id: uint }
+  { new-loan-id: uint, refinanced-at: uint, old-interest-rate: uint, new-interest-rate: uint }
 )
 
 (define-public (create-loan-request 
@@ -279,6 +286,81 @@
   )
 )
 
+(define-public (refinance-loan 
+    (original-loan-id uint)
+    (new-interest-rate uint)
+    (new-term-months uint)
+  )
+  (let
+    (
+      (original-loan (unwrap! (map-get? loans { loan-id: original-loan-id }) err-not-found))
+      (remaining-balance (calculate-remaining-balance original-loan-id))
+      (new-loan-id (var-get next-loan-id))
+      (new-monthly-payment (calculate-monthly-payment remaining-balance new-interest-rate new-term-months))
+      (installation (unwrap! (map-get? solar-installations { loan-id: original-loan-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get borrower original-loan)) err-unauthorized)
+    (asserts! (is-eq (get status original-loan) "funded") err-loan-not-active)
+    (asserts! (> (get payments-made original-loan) u0) err-refinance-invalid)
+    (asserts! (> remaining-balance u0) err-invalid-amount)
+    (asserts! (> new-interest-rate u0) err-invalid-amount)
+    (asserts! (> new-term-months u0) err-invalid-amount)
+    (asserts! (< new-interest-rate (get interest-rate original-loan)) err-refinance-invalid)
+    
+    (map-set loans
+      { loan-id: original-loan-id }
+      (merge original-loan { status: "refinanced" })
+    )
+    
+    (map-set loans
+      { loan-id: new-loan-id }
+      {
+        borrower: tx-sender,
+        loan-amount: remaining-balance,
+        funded-amount: remaining-balance,
+        interest-rate: new-interest-rate,
+        term-months: new-term-months,
+        monthly-payment: new-monthly-payment,
+        installation-cost: (get installation-cost original-loan),
+        panel-specs: (get panel-specs original-loan),
+        created-at: stacks-block-height,
+        funded-at: (some stacks-block-height),
+        last-payment: none,
+        payments-made: u0,
+        status: "funded",
+        collateral-percentage: (get collateral-percentage original-loan)
+      }
+    )
+    
+    (map-set solar-installations
+      { loan-id: new-loan-id }
+      {
+        installation-address: (get installation-address installation),
+        panel-capacity: (get panel-capacity installation),
+        estimated-monthly-generation: (get estimated-monthly-generation installation),
+        installer-principal: (get installer-principal installation),
+        installation-date: (get installation-date installation),
+        verification-status: (get verification-status installation)
+      }
+    )
+    
+    (map-set refinance-history
+      { original-loan-id: original-loan-id }
+      {
+        new-loan-id: new-loan-id,
+        refinanced-at: stacks-block-height,
+        old-interest-rate: (get interest-rate original-loan),
+        new-interest-rate: new-interest-rate
+      }
+    )
+    
+    (update-borrower-loans tx-sender new-loan-id)
+    (unwrap-panic (migrate-lender-contributions original-loan-id new-loan-id))
+    (var-set next-loan-id (+ new-loan-id u1))
+    (ok new-loan-id)
+  )
+)
+
 (define-read-only (get-loan (loan-id uint))
   (map-get? loans { loan-id: loan-id })
 )
@@ -301,6 +383,24 @@
 
 (define-read-only (get-lender-portfolio (lender principal))
   (map-get? lender-portfolio { lender: lender })
+)
+
+(define-read-only (get-refinance-history (original-loan-id uint))
+  (map-get? refinance-history { original-loan-id: original-loan-id })
+)
+
+(define-read-only (calculate-remaining-balance (loan-id uint))
+  (let
+    (
+      (loan (unwrap-panic (map-get? loans { loan-id: loan-id })))
+      (total-to-repay (+ (get loan-amount loan) (/ (* (get loan-amount loan) (get interest-rate loan) (get term-months loan)) (* u12 u100))))
+      (paid-so-far (* (get monthly-payment loan) (get payments-made loan)))
+    )
+    (if (> total-to-repay paid-so-far)
+      (- total-to-repay paid-so-far)
+      u0
+    )
+  )
 )
 
 (define-read-only (calculate-monthly-payment (principal uint) (annual-rate uint) (months uint))
@@ -375,6 +475,21 @@
         active-loans: (+ (get active-loans current-portfolio) u1)
       }
     )
+  )
+)
+
+(define-private (migrate-lender-contributions (old-loan-id uint) (new-loan-id uint))
+  (let
+    (
+      (loan-lender-data (default-to { lenders: (list), total-lenders: u0 } 
+                        (map-get? loan-lenders { loan-id: old-loan-id })))
+      (lenders-list (get lenders loan-lender-data))
+    )
+    (map-set loan-lenders
+      { loan-id: new-loan-id }
+      loan-lender-data
+    )
+    (ok true)
   )
 )
 
